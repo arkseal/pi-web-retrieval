@@ -41,7 +41,7 @@ export default function webRetrievalExtension(pi: ExtensionAPI) {
     name: "web_search",
     label: "Web Search",
     description:
-      "Search the web with token-bounded results. Supports Tavily, Exa, or free instant lookup. Caps results to protect context window.",
+      "Search the web with token-bounded results. Backed by Exa MCP (API key optional) with Tavily and DuckDuckGo fallbacks. Supports fast/deep search types and live crawling.",
     promptSnippet: "Search the web for up-to-date documentation or facts",
     parameters: Type.Object(
       {
@@ -49,9 +49,21 @@ export default function webRetrievalExtension(pi: ExtensionAPI) {
         numResults: Type.Optional(
           Type.Integer({
             minimum: 1,
-            maximum: 15,
-            description: "Number of search results to return (default: 8)",
+            maximum: 20,
+            description: "Number of search results to return (default: 8, max: 20)",
           })
+        ),
+        type: Type.Optional(
+          Type.Union(
+            [Type.Literal("auto"), Type.Literal("fast"), Type.Literal("deep")],
+            { description: "Search type - 'auto': balanced, 'fast': quick, 'deep': comprehensive" }
+          )
+        ),
+        livecrawl: Type.Optional(
+          Type.Union(
+            [Type.Literal("fallback"), Type.Literal("preferred")],
+            { description: "Live crawl mode - 'fallback': use cached scrape, 'preferred': force live crawl" }
+          )
         ),
       },
       { additionalProperties: false }
