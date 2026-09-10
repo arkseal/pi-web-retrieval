@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { executeWebFetch } from "./web-fetch.js";
 import { executeWebSearch } from "./web-search.js";
@@ -27,6 +28,15 @@ export default function webRetrievalExtension(pi: ExtensionAPI) {
       },
       { additionalProperties: false }
     ),
+    renderCall(args: any, theme: any, context: any) {
+      const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+      let content = theme.fg("toolTitle", theme.bold("web_fetch "));
+      if (args?.url) {
+        content += theme.fg("accent", args.url);
+      }
+      text.setText(content);
+      return text;
+    },
     async execute(_toolCallId, params) {
       const result = await executeWebFetch(params);
       return {
@@ -68,6 +78,21 @@ export default function webRetrievalExtension(pi: ExtensionAPI) {
       },
       { additionalProperties: false }
     ),
+    renderCall(args: any, theme: any, context: any) {
+      const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+      let content = theme.fg("toolTitle", theme.bold("web_search "));
+      if (args?.query) {
+        content += theme.fg("accent", `"${args.query}"`);
+      }
+      if (args?.type && args.type !== "auto") {
+        content += " " + theme.fg("dim", `[${args.type}]`);
+      }
+      if (args?.livecrawl === "preferred") {
+        content += " " + theme.fg("dim", `[live]`);
+      }
+      text.setText(content);
+      return text;
+    },
     async execute(_toolCallId, params) {
       const result = await executeWebSearch(params);
       return {
