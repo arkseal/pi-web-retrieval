@@ -5,6 +5,7 @@ import {
   parseExaMcpResponse,
   parseExaPayload,
   executeWebSearch,
+  clearWebSearchCache,
 } from "../src/web-search";
 
 describe("Exa URL constructor", () => {
@@ -85,6 +86,7 @@ describe("executeWebSearch flow", () => {
   beforeEach(() => {
     delete process.env.TAVILY_API_KEY;
     delete process.env.EXA_API_KEY;
+    clearWebSearchCache();
   });
 
   afterEach(() => {
@@ -198,5 +200,47 @@ describe("executeWebSearch flow", () => {
     const result = await executeWebSearch({ query: "long test", maxCharacters: 100 });
     expect(result.output.length).toBeLessThan(200);
     expect(result.output).toContain("(Search results truncated at 100 characters");
+  });
+
+  it("caches search results across queries", async () => {
+    let callCount = 0;
+    globalThis.fetch = (async () => {
+      callCount++;
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { content: [{ type: "text", text: "Cached content" }] },
+        }),
+        { status: 200 }
+      );
+    }) as any;
+
+    const res1 = await executeWebSearch({ query: "cache query" });
+    expect(res1.output).toBe("Cached content");
+    expect(callCount).toBe(1);
+
+    const res2 = await executeWebSearch({ query: "cache query" });
+    expect(res2.output).toBe("Cached content");
+    expect(callCount).toBe(1); // Cached, no second fetch
+  });
+
+  it("cleans HTML tags and entities from DuckDuckGo fallback", async () => {
+    globalThis.fetch = (async (url: any) => {
+      const u = url.toString();
+      if (u.includes("mcp.exa.ai")) return new Response("Fail", { status: 500 });
+      return new Response(
+        JSON.stringify({
+          Heading: "Clean DDG",
+          AbstractText: "<b>Important</b> &amp; <i>clean</i> result",
+          AbstractURL: "https://example.com/ddg",
+        }),
+        { status: 200 }
+      );
+    }) as any;
+
+    const result = await executeWebSearch({ query: "html in ddg" });
+    expect(result.output).toContain("**Important** & *clean* result");
+    expect(result.output).not.toContain("<b>");
   });
 });

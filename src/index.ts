@@ -1,13 +1,13 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { executeWebFetch } from "./web-fetch.js";
-import { executeWebSearch } from "./web-search.js";
+import { executeWebFetch, clearWebFetchCache } from "./web-fetch.js";
+import { executeWebSearch, clearWebSearchCache } from "./web-search.js";
 
-export { executeWebFetch } from "./web-fetch.js";
-export { executeWebSearch } from "./web-search.js";
-export { parseSourcegraphUrl, formatSourcegraphSearchMarkdown } from "./sourcegraph.js";
-export { cleanHtmlToMarkdown } from "./html-cleaner.js";
+export { executeWebFetch, clearWebFetchCache, isPrivateOrBlockedHost } from "./web-fetch.js";
+export { executeWebSearch, clearWebSearchCache } from "./web-search.js";
+export { parseSourcegraphUrl, formatSourcegraphSearchMarkdown, fetchSourcegraphFile } from "./sourcegraph.js";
+export { cleanHtmlToMarkdown, decodeHtmlEntities } from "./html-cleaner.js";
 
 export default function webRetrievalExtension(pi: ExtensionAPI) {
   // 1. Web Fetch Tool
@@ -32,17 +32,25 @@ export default function webRetrievalExtension(pi: ExtensionAPI) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       let content = theme.fg("toolTitle", theme.bold("web_fetch "));
       if (args?.url) {
-        content += theme.fg("accent", args.url);
+        content += theme.fg("accent", String(args.url));
       }
       text.setText(content);
       return text;
     },
-    async execute(_toolCallId, params) {
-      const result = await executeWebFetch(params);
-      return {
-        content: [{ type: "text", text: result.output }],
-        details: { url: params.url, source: result.source },
-      };
+    async execute(_toolCallId, params, signal) {
+      try {
+        const result = await executeWebFetch(params, signal);
+        return {
+          content: [{ type: "text", text: result.output }],
+          details: { url: params.url, source: result.source },
+        };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text", text: `Error fetching URL: ${err.message}` }],
+          isError: true,
+          details: { url: params.url, error: err.message },
+        };
+      }
     },
   });
 
@@ -93,12 +101,20 @@ export default function webRetrievalExtension(pi: ExtensionAPI) {
       text.setText(content);
       return text;
     },
-    async execute(_toolCallId, params) {
-      const result = await executeWebSearch(params);
-      return {
-        content: [{ type: "text", text: result.output }],
-        details: { query: params.query },
-      };
+    async execute(_toolCallId, params, signal) {
+      try {
+        const result = await executeWebSearch(params, signal);
+        return {
+          content: [{ type: "text", text: result.output }],
+          details: { query: params.query },
+        };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text", text: `Error searching web: ${err.message}` }],
+          isError: true,
+          details: { query: params.query, error: err.message },
+        };
+      }
     },
   });
 }

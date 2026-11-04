@@ -98,12 +98,23 @@ const SEARCH_QUERY = `query Search($query: String!) {
   }
 }`;
 
-export async function fetchSourcegraphGraphql(query: string): Promise<string> {
+export async function fetchSourcegraphGraphql(
+  query: string,
+  signal?: AbortSignal
+): Promise<string> {
   const endpoint = "https://sourcegraph.com/.api/graphql";
+  const timeoutSignal = AbortSignal.timeout(15000);
+  const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+
   const res = await fetch(endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "User-Agent": "PiAgent/1.0",
+    },
     body: JSON.stringify({ query: SEARCH_QUERY, variables: { query } }),
+    signal: combinedSignal,
   });
 
   if (!res.ok) {
@@ -112,4 +123,26 @@ export async function fetchSourcegraphGraphql(query: string): Promise<string> {
 
   const json = await res.json();
   return formatSourcegraphSearchMarkdown(query, json.data);
+}
+
+export async function fetchSourcegraphFile(
+  target: { repoName: string; rev?: string; filePath: string },
+  signal?: AbortSignal
+): Promise<string> {
+  const rev = target.rev ?? "HEAD";
+  const rawUrl = `https://sourcegraph.com/${target.repoName}@${rev}/-/raw/${target.filePath}`;
+  const timeoutSignal = AbortSignal.timeout(15000);
+  const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+
+  const res = await fetch(rawUrl, {
+    headers: { "User-Agent": "PiAgent/1.0" },
+    signal: combinedSignal,
+  });
+
+  if (!res.ok) {
+    throw new Error(`Failed to fetch Sourcegraph file ${target.filePath}: ${res.status} ${res.statusText}`);
+  }
+
+  const content = await res.text();
+  return `# ${target.repoName}/${target.filePath}\n\n\`\`\`\n${content}\n\`\`\``;
 }

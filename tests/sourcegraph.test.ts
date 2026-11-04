@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { parseSourcegraphUrl, formatSourcegraphSearchMarkdown } from "../src/sourcegraph";
+import {
+  parseSourcegraphUrl,
+  formatSourcegraphSearchMarkdown,
+  fetchSourcegraphFile,
+} from "../src/sourcegraph";
 
 describe("Sourcegraph URL Parser & Formatter", () => {
   it("parses search URLs correctly", () => {
@@ -44,5 +48,25 @@ describe("Sourcegraph URL Parser & Formatter", () => {
     expect(md).toContain("# Sourcegraph Search");
     expect(md).toContain("github.com/facebook/react/packages/react/src/React.js");
     expect(md).toContain("L42: export { useState } from './ReactHooks';");
+  });
+
+  it("fetches sourcegraph raw file and formats code block", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      return new Response("export const version = '18.0.0';", { status: 200 });
+    }) as any;
+
+    try {
+      const res = await fetchSourcegraphFile({
+        repoName: "github.com/facebook/react",
+        rev: "main",
+        filePath: "src/version.ts",
+      });
+
+      expect(res).toContain("# github.com/facebook/react/src/version.ts");
+      expect(res).toContain("export const version = '18.0.0';");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

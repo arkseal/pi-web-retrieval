@@ -1,3 +1,5 @@
+import { cleanHtmlToMarkdown } from "./html-cleaner.js";
+
 export interface WebSearchParams {
   query: string;
   numResults?: number;
@@ -8,6 +10,20 @@ export interface WebSearchParams {
 }
 
 export const EXA_MCP_URL = "https://mcp.exa.ai/mcp";
+
+const SEARCH_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const SEARCH_CACHE_MAX_ENTRIES = 100;
+
+interface SearchCacheEntry {
+  output: string;
+  expiresAt: number;
+}
+
+const searchCache = new Map<string, SearchCacheEntry>();
+
+export function clearWebSearchCache(): void {
+  searchCache.clear();
+}
 
 export function getExaUrl(apiKey?: string): string {
   if (!apiKey) return EXA_MCP_URL;
@@ -57,16 +73,20 @@ export async function callExaMcp(
     contextMaxCharacters?: number;
     apiKey?: string;
     timeoutMs?: number;
+    signal?: AbortSignal;
   } = {}
 ): Promise<string | undefined> {
   const url = getExaUrl(options.apiKey ?? process.env.EXA_API_KEY);
   const timeoutMs = options.timeoutMs ?? 25000;
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  const combinedSignal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
 
   const res = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
+      "User-Agent": "PiAgent/1.0",
     },
     body: JSON.stringify({
       jsonrpc: "2.0",
@@ -83,7 +103,7 @@ export async function callExaMcp(
         },
       },
     }),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: combinedSignal,
   });
 
   if (!res.ok) return undefined;
@@ -91,30 +111,67 @@ export async function callExaMcp(
   return parseExaMcpResponse(body);
 }
 
-export async function executeWebSearch(params: WebSearchParams): Promise<{ output: string }> {
-  const query = params.query.trim();
-  const numResults = Math.min(params.numResults ?? 8, 20);
-  const maxChars = params.maxCharacters ?? 8000;
+export async function executeWebSearch(
+  params: WebSearchParams,
+  signal?: AbortSignal
+): Promise<{ output: string }> {
+  const query = (params.query ?? "").trim();
+  if (!query) {
+    return { output: "Search query cannot be empty." };
+  }
+
+  const numResults = Math.min(Math.max(params.numResults ?? 8, 1), 20);
+  const maxChars = Math.min(Math.max(params.maxCharacters ?? 8000, 100), 50000);
   const contextMaxCharacters = params.contextMaxCharacters ?? maxChars;
+
+  const cacheKey = JSON.stringify({
+    q: query.toLowerCase(),
+    n: numResults,
+    m: maxChars,
+    t: params.type,
+    l: params.livecrawl,
+  });
+
+  // Check cache
+  const cached = searchCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { output: cached.output };
+  }
+
+  const setCache = (output: string) => {
+    if (searchCache.size >= SEARCH_CACHE_MAX_ENTRIES) {
+      const firstKey = searchCache.keys().next().value;
+      if (firstKey) searchCache.delete(firstKey);
+    }
+    searchCache.set(cacheKey, { output, expiresAt: Date.now() + SEARCH_CACHE_TTL_MS });
+  };
 
   // 1. Tavily API (if configured)
   if (process.env.TAVILY_API_KEY) {
     try {
+      const timeoutSignal = AbortSignal.timeout(15000);
+      const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+
       const res = await fetch("https://api.tavily.com/search", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "User-Agent": "PiAgent/1.0" },
         body: JSON.stringify({
           api_key: process.env.TAVILY_API_KEY,
           query,
           max_results: numResults,
         }),
-        signal: AbortSignal.timeout(15000),
+        signal: combinedSignal,
       });
+
       if (res.ok) {
         const data = await res.json();
-        const results = (data.results ?? []).map((r: any) => `### ${r.title}\nURL: ${r.url}\n${r.content}`);
+        const results = (data.results ?? []).map(
+          (r: any) => `### ${r.title}\nURL: ${r.url}\n${r.content}`
+        );
         if (results.length > 0) {
-          return { output: truncateOutput(results.join("\n\n"), maxChars) };
+          const out = truncateOutput(results.join("\n\n"), maxChars);
+          setCache(out);
+          return { output: out };
         }
       }
     } catch {}
@@ -128,33 +185,47 @@ export async function executeWebSearch(params: WebSearchParams): Promise<{ outpu
       livecrawl: params.livecrawl,
       contextMaxCharacters,
       apiKey: process.env.EXA_API_KEY,
+      signal,
     });
     if (exaResult && exaResult.trim().length > 0) {
-      return { output: truncateOutput(exaResult.trim(), maxChars) };
+      const out = truncateOutput(exaResult.trim(), maxChars);
+      setCache(out);
+      return { output: out };
     }
   } catch {}
 
   // 3. DuckDuckGo Instant Answer API (Free fallback, 0 keys required)
   try {
+    const timeoutSignal = AbortSignal.timeout(10000);
+    const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+
     const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
     const res = await fetch(url, {
       headers: { "User-Agent": "PiAgent/1.0" },
-      signal: AbortSignal.timeout(10000),
+      signal: combinedSignal,
     });
+
     if (res.ok) {
       const data = await res.json();
       const lines: string[] = [];
+
       if (data.AbstractText) {
-        lines.push(`### ${data.Heading || query}\n${data.AbstractText}\nSource: ${data.AbstractURL}`);
+        const cleanAbstract = cleanHtmlToMarkdown(data.AbstractText, 1000);
+        lines.push(`### ${data.Heading || query}\n${cleanAbstract}\nSource: ${data.AbstractURL}`);
       }
+
       const topics = data.RelatedTopics ?? [];
       for (const t of topics.slice(0, numResults)) {
         if (t.Text && t.FirstURL) {
-          lines.push(`- ${t.Text}\n  ${t.FirstURL}`);
+          const cleanText = cleanHtmlToMarkdown(t.Text, 500);
+          lines.push(`- ${cleanText}\n  ${t.FirstURL}`);
         }
       }
+
       if (lines.length > 0) {
-        return { output: truncateOutput(lines.join("\n\n"), maxChars) };
+        const out = truncateOutput(lines.join("\n\n"), maxChars);
+        setCache(out);
+        return { output: out };
       }
     }
   } catch {}
