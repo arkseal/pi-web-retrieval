@@ -3,15 +3,30 @@ import {
   executeWebFetch,
   clearWebFetchCache,
   isPrivateOrBlockedHost,
+  setHostLookupForTests,
 } from "../src/web-fetch";
 
 describe("web-fetch SSRF protection", () => {
+  beforeEach(() => {
+    clearWebFetchCache();
+    setHostLookupForTests(async () => [{ address: "93.184.216.34", family: 4 }]);
+  });
+
+  afterEach(() => {
+    setHostLookupForTests(undefined);
+  });
+
   it("identifies private and blocked hosts", () => {
     expect(isPrivateOrBlockedHost("localhost")).toBe(true);
+    expect(isPrivateOrBlockedHost("sub.localhost")).toBe(true);
     expect(isPrivateOrBlockedHost("127.0.0.1")).toBe(true);
     expect(isPrivateOrBlockedHost("127.1.2.3")).toBe(true);
     expect(isPrivateOrBlockedHost("0.0.0.0")).toBe(true);
     expect(isPrivateOrBlockedHost("::1")).toBe(true);
+    expect(isPrivateOrBlockedHost("[::ffff:127.0.0.1]")).toBe(true);
+    expect(isPrivateOrBlockedHost("::ffff:7f00:1")).toBe(true);
+    expect(isPrivateOrBlockedHost("fd00::1")).toBe(true);
+    expect(isPrivateOrBlockedHost("fe80::1")).toBe(true);
     expect(isPrivateOrBlockedHost("169.254.169.254")).toBe(true);
     expect(isPrivateOrBlockedHost("10.0.0.1")).toBe(true);
     expect(isPrivateOrBlockedHost("172.16.5.4")).toBe(true);
@@ -105,6 +120,16 @@ describe("web-fetch SSRF protection", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it("blocks domains that resolve to any private IP (DNS rebinding / multi-record)", async () => {
+    setHostLookupForTests(async () => [
+      { address: "93.184.216.34", family: 4 },
+      { address: "127.0.0.1", family: 4 },
+    ]);
+    await expect(executeWebFetch({ url: "https://rebind.example.com/secret" })).rejects.toThrow(
+      "resolved to blocked private address"
+    );
+  });
 });
 
 describe("web-fetch execution and caching", () => {
@@ -112,10 +137,12 @@ describe("web-fetch execution and caching", () => {
 
   beforeEach(() => {
     clearWebFetchCache();
+    setHostLookupForTests(async () => [{ address: "93.184.216.34", family: 4 }]);
   });
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    setHostLookupForTests(undefined);
   });
 
   it("caches successful fetch results", async () => {

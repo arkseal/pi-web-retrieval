@@ -25,28 +25,68 @@ interface CacheEntry {
 
 const fetchCache = new Map<string, CacheEntry>();
 
+export type HostLookup = (
+  hostname: string
+) => Promise<Array<{ address: string; family?: number }>>;
+
+const defaultHostLookup: HostLookup = async (hostname) => {
+  const records = await dns.promises.lookup(hostname, { all: true });
+  return Array.isArray(records) ? records : [records];
+};
+
+let activeHostLookup: HostLookup = defaultHostLookup;
+
+export function setHostLookupForTests(lookup?: HostLookup): void {
+  activeHostLookup = lookup ?? defaultHostLookup;
+}
+
 export function clearWebFetchCache(): void {
   fetchCache.clear();
 }
 
 /**
  * SSRF and private network access protection.
- * Blocks cloud instance metadata (AWS 169.254.169.254), loopback, and private IPv4 blocks.
+ * Blocks cloud instance metadata (AWS 169.254.169.254), loopback, and private IPv4/IPv6 blocks.
  */
 export function isPrivateOrBlockedHost(hostname: string): boolean {
   const host = hostname.toLowerCase().trim();
 
-  // Remove IPv6 brackets if present
-  const cleanHost = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  // Remove IPv6 brackets and zone index if present
+  const bracketStripped = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  const cleanHost = bracketStripped.split("%")[0].replace(/\.$/, "");
 
   if (
+    !cleanHost ||
     cleanHost === "localhost" ||
+    cleanHost.endsWith(".localhost") ||
     cleanHost === "0.0.0.0" ||
     cleanHost === "127.0.0.1" ||
     cleanHost === "::1" ||
-    cleanHost === "::"
+    cleanHost === "::" ||
+    cleanHost === "0:0:0:0:0:0:0:1" ||
+    cleanHost === "0:0:0:0:0:0:0:0"
   ) {
     return true;
+  }
+
+  // IPv6 Unique Local (fc00::/7) and Link-Local (fe80::/10)
+  if (/^f[cd][0-9a-f]{2}:/i.test(cleanHost) || /^fe[89ab][0-9a-f]:/i.test(cleanHost)) {
+    return true;
+  }
+
+  // IPv4-mapped IPv6 (::ffff:a.b.c.d or ::ffff:7f00:1)
+  if (cleanHost.startsWith("::ffff:")) {
+    const mapped = cleanHost.slice("::ffff:".length);
+    if (mapped.includes(".")) {
+      return isPrivateOrBlockedHost(mapped);
+    }
+    const hexMatch = mapped.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+    if (hexMatch) {
+      const hi = parseInt(hexMatch[1], 16);
+      const lo = parseInt(hexMatch[2], 16);
+      const dotted = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+      return isPrivateOrBlockedHost(dotted);
+    }
   }
 
   // AWS/GCP/Azure instance metadata service
@@ -71,7 +111,14 @@ export function isPrivateOrBlockedHost(hostname: string): boolean {
   return false;
 }
 
-async function validateHostSafety(hostname: string, allowPrivate: boolean): Promise<void> {
+async function validateHostSafety(
+  hostname: string,
+  allowPrivate: boolean,
+  signal?: AbortSignal
+): Promise<void> {
+  if (signal?.aborted) {
+    throw new Error("Request cancelled by signal");
+  }
   if (allowPrivate) return;
 
   if (isPrivateOrBlockedHost(hostname)) {
@@ -79,13 +126,40 @@ async function validateHostSafety(hostname: string, allowPrivate: boolean): Prom
   }
 
   // DNS lookup to guard against DNS rebinding (e.g. 127.0.0.1.nip.io)
+  const dnsSignal = signal
+    ? AbortSignal.any([signal, AbortSignal.timeout(2000)])
+    : AbortSignal.timeout(2000);
   try {
-    const { address } = await dns.promises.lookup(hostname);
-    if (isPrivateOrBlockedHost(address)) {
-      throw new Error(`Domain '${hostname}' resolved to blocked private address: ${address}`);
+    const records = await new Promise<Array<{ address: string; family?: number }>>(
+      (resolve, reject) => {
+        const onAbort = () => reject(dnsSignal.reason ?? new Error("DNS lookup aborted"));
+        if (dnsSignal.aborted) {
+          onAbort();
+          return;
+        }
+        dnsSignal.addEventListener("abort", onAbort, { once: true });
+        activeHostLookup(hostname).then(
+          (res) => {
+            dnsSignal.removeEventListener("abort", onAbort);
+            resolve(res);
+          },
+          (err) => {
+            dnsSignal.removeEventListener("abort", onAbort);
+            reject(err);
+          }
+        );
+      }
+    );
+    for (const record of records) {
+      if (isPrivateOrBlockedHost(record.address)) {
+        throw new Error(`Domain '${hostname}' resolved to blocked private address: ${record.address}`);
+      }
     }
   } catch (err: any) {
-    if (err.message.includes("blocked private address")) throw err;
+    if (signal?.aborted) {
+      throw new Error("Request cancelled by signal");
+    }
+    if (err?.message?.includes("blocked private address")) throw err;
     // Allow network fetch to handle standard resolution errors if dns.lookup fails in test/mock
   }
 }
@@ -109,10 +183,15 @@ async function readStreamWithLimit(
   try {
     while (true) {
       if (signal?.aborted) {
+        try { void reader.cancel().catch(() => {}); } catch {}
         throw new Error("Download aborted by signal");
       }
 
       const { done, value } = await reader.read();
+      if (signal?.aborted) {
+        try { void reader.cancel().catch(() => {}); } catch {}
+        throw new Error("Download aborted by signal");
+      }
       if (done) break;
 
       if (value) {
@@ -120,13 +199,14 @@ async function readStreamWithLimit(
         text += decoder.decode(value, { stream: true });
 
         if (totalBytes >= maxBytes) {
-          reader.cancel().catch(() => {});
+          try { void reader.cancel().catch(() => {}); } catch {}
           break;
         }
       }
     }
   } finally {
     text += decoder.decode();
+    try { reader.releaseLock(); } catch {}
   }
 
   return text;
@@ -197,7 +277,7 @@ export async function executeWebFetch(
       throw new Error(`Disallowed protocol in redirect: ${currentParsed.protocol}`);
     }
 
-    await validateHostSafety(currentParsed.hostname, allowPrivate);
+    await validateHostSafety(currentParsed.hostname, allowPrivate, combinedSignal);
 
     res = await fetch(currentUrl, {
       headers: {
@@ -210,6 +290,7 @@ export async function executeWebFetch(
 
     // Check for HTTP redirects (301, 302, 303, 307, 308)
     if ([301, 302, 303, 307, 308].includes(res.status)) {
+      try { void res.body?.cancel().catch(() => {}); } catch {}
       redirectCount++;
       if (redirectCount > MAX_REDIRECTS) {
         throw new Error(`Too many redirects (exceeded limit of ${MAX_REDIRECTS})`);
@@ -236,7 +317,7 @@ export async function executeWebFetch(
   }
 
   const contentType = res.headers.get("content-type") || "";
-  const rawBody = await readStreamWithLimit(res, MAX_DOWNLOAD_BYTES, signal);
+  const rawBody = await readStreamWithLimit(res, MAX_DOWNLOAD_BYTES, combinedSignal);
 
   let finalResult: WebFetchResult;
 
