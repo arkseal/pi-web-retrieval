@@ -25,6 +25,11 @@ export default function webRetrievalExtension(pi: ExtensionAPI) {
             description: "Maximum character budget (defaults to 12,000 chars / ~3,000 tokens)",
           })
         ),
+        allowPrivate: Type.Optional(
+          Type.Boolean({
+            description: "Allow fetching from private IP addresses and localhost (default: false)",
+          })
+        ),
       },
       { additionalProperties: false }
     ),
@@ -37,7 +42,11 @@ export default function webRetrievalExtension(pi: ExtensionAPI) {
       text.setText(content);
       return text;
     },
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId, params, signal): Promise<{
+      content: Array<{ type: "text"; text: string }>;
+      isError?: boolean;
+      details: { url: string; source?: string; error?: string };
+    }> {
       try {
         const result = await executeWebFetch(params, signal);
         return {
@@ -101,7 +110,11 @@ export default function webRetrievalExtension(pi: ExtensionAPI) {
       text.setText(content);
       return text;
     },
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId, params, signal): Promise<{
+      content: Array<{ type: "text"; text: string }>;
+      isError?: boolean;
+      details: { query: string; error?: string };
+    }> {
       try {
         const result = await executeWebSearch(params, signal);
         return {

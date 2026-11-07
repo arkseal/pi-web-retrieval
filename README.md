@@ -11,6 +11,10 @@ Token-optimized web fetch and search with Sourcegraph GraphQL code scraper for t
    - Negotiates `Accept: text/markdown` first (returns clean markdown for modern docs and `llms.txt`).
    - Strips `<script>`, `<style>`, `<nav>`, `<footer>`, `<header>`, and SVG boilerplate before conversion.
    - Enforces a strict 12,000-character cap (~3,000 tokens) with an explicit truncation note.
+   - **SSRF & Private Network Protection:** Blocks loopback (`localhost`, `127.0.0.1`), cloud instance metadata (`169.254.169.254`), and private IPv4 blocks by default.
+   - **DNS & Redirect Verification:** Validates DNS resolutions against private networks and inspects HTTP 301/302 redirects to prevent redirect-based SSRF.
+   - **Localhost Opt-In:** Pass `allowPrivate: true` or set `PI_WEB_FETCH_ALLOW_PRIVATE=1` to allow fetching from local dev servers (e.g. `http://localhost:3000`).
+   - **Bounded Streaming & Caching:** Enforces a 2MB stream limit and 100-entry in-memory LRU cache with 5-minute TTL.
 
 3. **Lean Web Search (`web_search`):**
    - Supports Tavily (`TAVILY_API_KEY`) and Exa (`EXA_API_KEY`), with a free DuckDuckGo Instant Answer fallback.

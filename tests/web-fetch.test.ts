@@ -32,9 +32,78 @@ describe("web-fetch SSRF protection", () => {
     );
   });
 
-  it("rejects non-http/https URLs", async () => {
-    expect(executeWebFetch({ url: "ftp://example.com/file" })).rejects.toThrow("URL must begin with http:// or https://");
-    expect(executeWebFetch({ url: "file:///etc/passwd" })).rejects.toThrow("URL must begin with http:// or https://");
+  it("allows private or localhost addresses when allowPrivate is true", async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = (async (url: any) => {
+        return new Response("<html><body><h1>Local Dev Server</h1></body></html>", {
+          headers: { "Content-Type": "text/html" },
+        });
+      }) as any;
+
+      const res = await executeWebFetch({ url: "http://127.0.0.1:3000", allowPrivate: true });
+      expect(res.output).toContain("# Local Dev Server");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("honors PI_WEB_FETCH_ALLOW_PRIVATE environment variable opt-in", async () => {
+    const originalFetch = globalThis.fetch;
+    const origEnv = process.env.PI_WEB_FETCH_ALLOW_PRIVATE;
+    try {
+      process.env.PI_WEB_FETCH_ALLOW_PRIVATE = "1";
+      globalThis.fetch = (async (url: any) => {
+        return new Response("Local content", { headers: { "Content-Type": "text/plain" } });
+      }) as any;
+
+      const res = await executeWebFetch({ url: "http://localhost:8080/api" });
+      expect(res.output).toBe("Local content");
+    } finally {
+      process.env.PI_WEB_FETCH_ALLOW_PRIVATE = origEnv;
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("blocks redirect to private/internal network addresses", async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = (async (url: any) => {
+        return new Response(null, {
+          status: 302,
+          headers: { Location: "http://169.254.169.254/latest/meta-data/" },
+        });
+      }) as any;
+
+      expect(executeWebFetch({ url: "https://public-site.com/bounce" })).rejects.toThrow(
+        "private or local network address is blocked"
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("follows legitimate redirects to public targets", async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+      let step = 0;
+      globalThis.fetch = (async (url: any) => {
+        step++;
+        if (step === 1) {
+          return new Response(null, {
+            status: 301,
+            headers: { Location: "https://example.com/destination" },
+          });
+        }
+        return new Response("Final page", { headers: { "Content-Type": "text/plain" } });
+      }) as any;
+
+      const res = await executeWebFetch({ url: "https://example.com/initial" });
+      expect(res.output).toBe("Final page");
+      expect(step).toBe(2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
 

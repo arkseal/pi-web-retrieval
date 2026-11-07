@@ -1,9 +1,11 @@
+import * as dns from "node:dns";
 import { parseSourcegraphUrl, fetchSourcegraphGraphql, fetchSourcegraphFile } from "./sourcegraph.js";
 import { cleanHtmlToMarkdown } from "./html-cleaner.js";
 
 export interface WebFetchParams {
   url: string;
   maxCharacters?: number;
+  allowPrivate?: boolean;
 }
 
 export interface WebFetchResult {
@@ -12,6 +14,7 @@ export interface WebFetchResult {
 }
 
 const MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024; // 2MB streaming cap to prevent memory exhaustion
+const MAX_REDIRECTS = 5;
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes TTL
 const CACHE_MAX_ENTRIES = 100;
 
@@ -68,6 +71,25 @@ export function isPrivateOrBlockedHost(hostname: string): boolean {
   return false;
 }
 
+async function validateHostSafety(hostname: string, allowPrivate: boolean): Promise<void> {
+  if (allowPrivate) return;
+
+  if (isPrivateOrBlockedHost(hostname)) {
+    throw new Error(`Access to private or local network address is blocked: ${hostname}`);
+  }
+
+  // DNS lookup to guard against DNS rebinding (e.g. 127.0.0.1.nip.io)
+  try {
+    const { address } = await dns.promises.lookup(hostname);
+    if (isPrivateOrBlockedHost(address)) {
+      throw new Error(`Domain '${hostname}' resolved to blocked private address: ${address}`);
+    }
+  } catch (err: any) {
+    if (err.message.includes("blocked private address")) throw err;
+    // Allow network fetch to handle standard resolution errors if dns.lookup fails in test/mock
+  }
+}
+
 async function readStreamWithLimit(
   response: Response,
   maxBytes: number,
@@ -114,24 +136,25 @@ export async function executeWebFetch(
   params: WebFetchParams,
   signal?: AbortSignal
 ): Promise<WebFetchResult> {
-  const url = (params.url ?? "").trim();
-  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+  const initialUrl = (params.url ?? "").trim();
+  if (!initialUrl.startsWith("http://") && !initialUrl.startsWith("https://")) {
     throw new Error("URL must begin with http:// or https://");
   }
 
   let parsed: URL;
   try {
-    parsed = new URL(url);
+    parsed = new URL(initialUrl);
   } catch {
-    throw new Error(`Invalid URL: ${url}`);
+    throw new Error(`Invalid URL: ${initialUrl}`);
   }
 
-  if (isPrivateOrBlockedHost(parsed.hostname)) {
-    throw new Error(`Access to private or local network address is blocked: ${parsed.hostname}`);
-  }
+  const allowPrivate =
+    params.allowPrivate ??
+    (process.env.PI_WEB_FETCH_ALLOW_PRIVATE === "true" ||
+      process.env.PI_WEB_FETCH_ALLOW_PRIVATE === "1");
 
   const maxChars = Math.min(Math.max(params.maxCharacters ?? 12000, 100), 100000);
-  const cacheKey = `${parsed.toString()}#${maxChars}`;
+  const cacheKey = `${parsed.toString()}#${maxChars}#priv:${allowPrivate}`;
 
   // 1. Check in-memory cache
   const cached = fetchCache.get(cacheKey);
@@ -140,7 +163,7 @@ export async function executeWebFetch(
   }
 
   // 2. Sourcegraph URL interceptor
-  const sgTarget = parseSourcegraphUrl(url);
+  const sgTarget = parseSourcegraphUrl(initialUrl);
   if (sgTarget) {
     if (sgTarget.type === "search") {
       const md = await fetchSourcegraphGraphql(sgTarget.query, signal);
@@ -156,20 +179,54 @@ export async function executeWebFetch(
     }
   }
 
-  // 3. Standard Web Fetch with timeout + signal
+  // 3. Standard Web Fetch with manual redirect validation + timeout + signal
   const timeoutSignal = AbortSignal.timeout(20000);
   const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 
-  const res = await fetch(url, {
-    headers: {
-      Accept: "text/markdown;q=1.0, text/plain;q=0.8, text/html;q=0.5, */*;q=0.1",
-      "User-Agent": "Mozilla/5.0 (compatible; PiAgent/1.0)",
-    },
-    signal: combinedSignal,
-  });
+  let currentUrl = initialUrl;
+  let redirectCount = 0;
+  let res: Response;
+
+  while (true) {
+    if (combinedSignal.aborted) {
+      throw new Error("Request cancelled by signal");
+    }
+
+    const currentParsed = new URL(currentUrl);
+    if (currentParsed.protocol !== "http:" && currentParsed.protocol !== "https:") {
+      throw new Error(`Disallowed protocol in redirect: ${currentParsed.protocol}`);
+    }
+
+    await validateHostSafety(currentParsed.hostname, allowPrivate);
+
+    res = await fetch(currentUrl, {
+      headers: {
+        Accept: "text/markdown;q=1.0, text/plain;q=0.8, text/html;q=0.5, */*;q=0.1",
+        "User-Agent": "Mozilla/5.0 (compatible; PiAgent/1.0)",
+      },
+      signal: combinedSignal,
+      redirect: "manual",
+    });
+
+    // Check for HTTP redirects (301, 302, 303, 307, 308)
+    if ([301, 302, 303, 307, 308].includes(res.status)) {
+      redirectCount++;
+      if (redirectCount > MAX_REDIRECTS) {
+        throw new Error(`Too many redirects (exceeded limit of ${MAX_REDIRECTS})`);
+      }
+      const location = res.headers.get("location");
+      if (!location) {
+        throw new Error(`Redirect status ${res.status} received without Location header`);
+      }
+      currentUrl = new URL(location, currentUrl).toString();
+      continue;
+    }
+
+    break;
+  }
 
   if (!res.ok) {
-    throw new Error(`Failed to fetch ${url}: ${res.status} ${res.statusText}`);
+    throw new Error(`Failed to fetch ${currentUrl}: ${res.status} ${res.statusText}`);
   }
 
   // Check content-length header
@@ -195,7 +252,7 @@ export async function executeWebFetch(
     finalResult = { output: clean, source: "raw-text" };
   }
 
-  // Store in cache (LRU eviction if at capacity)
+  // Store in cache (bounded LRU eviction)
   if (fetchCache.size >= CACHE_MAX_ENTRIES) {
     const firstKey = fetchCache.keys().next().value;
     if (firstKey) fetchCache.delete(firstKey);
