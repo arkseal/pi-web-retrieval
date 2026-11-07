@@ -1,0 +1,3 @@
+node_modules/
+# Keep the canonical development lock even with a global bun.lock ignore.
+!bun.lock
