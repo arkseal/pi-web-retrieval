@@ -1,7 +1,6 @@
 # Development and compatibility
 
-Development checks pin Pi **1.5.0** and TypeBox **1.3.27**, matching the audited
-host. Wildcard peers follow Pi's module-sharing contract; runtime Pi installations
+Development checks pin Pi **1.6.1** and TypeBox **1.4.3**. Wildcard peers follow Pi's module-sharing contract; runtime Pi installations
 provide those modules rather than installing private copies.
 
 ```sh
